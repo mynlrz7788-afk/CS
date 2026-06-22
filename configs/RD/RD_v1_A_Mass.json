@@ -1,0 +1,88 @@
+{
+    "dataset": {
+        "name": "Mass",
+        "root_path": "/home/u2508183004/zyn/datasets",
+        "input_size": 1024,
+        "batch_size": 8,
+        "val_batch_size": 8,
+        "num_workers": 8,
+        "pin_memory": true
+    },
+    "model": {
+        "name": "RD_v1_A",
+        "n_channels": 3,
+        "n_classes": 1,
+        "pretrained": true,
+        "return_aux": true,
+        "dino_model_name": "dinov3_vits16",
+        "dino_repo_path": "/home/u2508183004/zyn/SEG/dinounet/dinov3",
+        "dino_ckpt_path": "/home/u2508183004/zyn/SEG/weight/dinov3/dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+        "dino_layers": [
+            2,
+            5,
+            8,
+            11
+        ],
+        "dino_embed_dim": 384,
+        "dino_patch_size": 16,
+        "dino_normalize": false,
+        "dino_intermediate_norm": true,
+        "adapter_bottleneck": 64,
+        "adapter_dropout": 0.0,
+        "gn_groups": 16,
+        "aux_mid_ch": 64,
+        "param_group_lrs": {
+            "dino_adapters": 0.00012,
+            "pseudo_encoder": 0.00024,
+            "decoder": 0.00024
+        },
+        "param_group_weight_decays": {
+            "dino_adapters": 0.02,
+            "pseudo_encoder": 0.0001,
+            "decoder": 0.0001
+        }
+    },
+    "training": {
+        "epochs": 120,
+        "optimizer": "AdamW",
+        "lr": 0.0002,
+        "weight_decay": 0.0001,
+        "scheduler": "ReduceLROnPlateau",
+        "scheduler_mode": "min",
+        "scheduler_factor": 0.5,
+        "scheduler_patience": 8,
+        "early_stop_patience":40,
+        "amp": true,
+        "use_amp": true,
+        "ema": true,
+        "use_ema": true,
+        "ema_decay": 0.999,
+        "grad_clip": 1.0,
+        "save_best_by": "val_iou",
+        "threshold": 0.5,
+        "loss": {
+            "name": "BCE_Dice",
+            "main_weight": 1.0,
+            "aux_weights": {
+                "logit16": 0.15,
+                "logit8": 0.2,
+                "logit4": 0.1,
+                "logit2": 0.05
+            },
+            "prior_weights": {}
+        }
+    },
+    "test": {
+        "threshold": 0.5,
+        "tta": false,
+        "tta_h": false,
+        "tta_v": false,
+        "amp": true
+    },
+    "notes": {
+        "change_from_RD_v1": "RD_v1_A keeps the same PEFT-DINO + RD decoder design, but changes the DINO pseudo pyramid to single-layer mapping: A11->d4, A8->d3, A5->d2, A2->d1/d0. No A8+A11, A5+A8, or A2+A5 cross-layer fusion.",
+        "change_from_RD_v4": "RD_v1_A removes CNN encoder, RoadPrior heads, and DLAEM4/8/16. It keeps PEFT-DINO A2/A5/A8/A11 and the unchanged RD decoder.",
+        "model_file": "Copy RD_v1_A.py into your models directory and register RD_v1_A in models/__init__.py.",
+        "purpose": "Single-layer DINO-only ablation: test whether one DINO layer per decoder scale is enough for the RD decoder."
+    }
+}

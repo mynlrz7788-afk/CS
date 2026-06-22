@@ -1,0 +1,106 @@
+{
+  "dataset": {
+    "name": "DRIVE_512",
+    "root_path": "/home/u2508183004/zyn/datasets",
+    "input_size": 512,
+    "batch_size": 4,
+    "val_batch_size": 4,
+    "num_workers": 8,
+    "drop_last": true
+  },
+  "model": {
+    "name": "RD_v5",
+    "num_classes": 1,
+    "pretrained": true,
+    "resnet_pretrained": true,
+    "return_aux": true,
+    "dino_model_name": "dinov3_vits16",
+    "dino_repo_path": "/home/u2508183004/zyn/SEG/dinounet/dinov3",
+    "dino_ckpt_path": "/home/u2508183004/zyn/SEG/weight/dinov3/dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+    "dino_layers": [
+      2,
+      5,
+      8,
+      11
+    ],
+    "dino_embed_dim": 384,
+    "dino_patch_size": 16,
+    "dino_normalize": false,
+    "dino_intermediate_norm": true,
+    "adapter_bottleneck": 64,
+    "adapter_dropout": 0.03,
+    "use_external_token_adapter": true,
+    "external_adapter_bottleneck": 96,
+    "external_adapter_dropout": 0.03,
+    "gn_groups": 16,
+    "rdfq4_heads": 4,
+    "rdfq4_points": 4,
+    "rdfq4_offset_scale": 3.0,
+    "rdfq4_dim": 64,
+    "rdfq8_heads": 4,
+    "rdfq16_heads": 8,
+    "rdfq_points": 4,
+    "rdfq8_offset_scale": 4.0,
+    "rdfq16_offset_scale": 5.0,
+    "rdfq8_dim": 192,
+    "rdfq16_dim": 256,
+    "reliability_init": 0.8,
+    "prior_mid_max": 96,
+    "aux_mid_ch": 48,
+    "centerline_mid_ch": 40,
+    "param_group_lrs": {
+      "dino_adapters": 5e-05,
+      "structure_token_adapter": 7e-05,
+      "cnn_encoder": 4e-05,
+      "structure_priors": 8e-05,
+      "rdfq": 9e-05,
+      "topology_decoder": 0.0001
+    },
+    "param_group_weight_decays": {
+      "dino_adapters": 0.02,
+      "structure_token_adapter": 0.02,
+      "cnn_encoder": 0.012,
+      "structure_priors": 0.012,
+      "rdfq": 0.012,
+      "topology_decoder": 0.01
+    }
+  },
+  "loss": {
+    "bce_weight": 0.48,
+    "dice_weight": 0.52,
+    "aux16_weight": 0.12,
+    "aux8_weight": 0.18,
+    "aux4_weight": 0.12,
+    "aux2_weight": 0.05,
+    "prior_weight": 0.015,
+    "boundary_weight": 0.04,
+    "boundary_kernel": 3
+  },
+  "training": {
+    "seed": 3407,
+    "epochs": 180,
+    "lr": 8e-05,
+    "weight_decay": 0.012,
+    "amp": true,
+    "grad_clip": 0.6,
+    "threshold": 0.5,
+    "lr_factor": 0.5,
+    "lr_patience": 8,
+    "min_lr": 1e-07,
+    "early_stop_patience": 35,
+    "ema_enabled": true,
+    "ema_decay": 0.999,
+    "ema_start_epoch": 5
+  },
+  "logging": {
+    "log_grad_norm": true,
+    "threshold_sweep": [
+      0.3,
+      0.35,
+      0.4,
+      0.45,
+      0.5,
+      0.55
+    ]
+  }
+}

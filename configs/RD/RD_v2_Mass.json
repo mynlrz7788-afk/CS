@@ -1,0 +1,79 @@
+{
+  "dataset": {
+    "name": "Mass",
+    "root_path": "/home/u2508183004/zyn/datasets",
+    "input_size": 1024,
+    "batch_size": 8,
+    "val_batch_size": 8,
+    "num_workers": 8
+  },
+
+  "model": {
+    "name": "RD_v2",
+    "adapter_bottleneck": 64,
+    "adapter_dropout": 0.0,
+
+    "encoder_channels": [64, 128, 256, 480],
+    "decoder_channels": [384, 288, 192, 128],
+
+    "gn_groups": 16,
+
+    "dlaem8_heads": 4,
+    "dlaem16_heads": 8,
+    "dlaem_points": 6,
+    "dlaem8_offset_scale": 4.0,
+    "dlaem16_offset_scale": 5.0,
+
+    "param_group_lrs": {
+      "dino_adapters": 0.00006,
+      "cnn_encoder": 0.00005,
+      "road_priors": 0.0001,
+      "dlaem": 0.0001,
+      "decoder": 0.00012
+    },
+
+    "param_group_weight_decays": {
+      "dino_adapters": 0.02,
+      "cnn_encoder": 0.01,
+      "road_priors": 0.01,
+      "dlaem": 0.01,
+      "decoder": 0.01
+    },
+
+    "max_trainable_params_m": 35.0
+  },
+
+  "loss": {
+    "bce_weight": 0.45,
+    "dice_weight": 0.55,
+
+    "aux8_weight": 0.25,
+    "aux16_weight": 0.15,
+    "aux4_weight": 0.15,
+    "aux2_weight": 0.08,
+
+    "prior_weight": 0.04,
+    "boundary_weight": 0.04,
+    "boundary_kernel": 3
+  },
+
+  "training": {
+    "seed": 3407,
+    "epochs": 240,
+    "lr": 0.0001,
+    "weight_decay": 0.01,
+    "amp": true,
+    "grad_clip": 1.0,
+
+    "threshold": 0.5,
+
+    "lr_factor": 0.5,
+    "lr_patience": 8,
+    "min_lr": 0.0000001,
+    "early_stop_patience": 40,
+
+    "ema_enabled": true,
+    "ema_decay": 0.9995,
+    "ema_start_epoch": 5
+  }
+}
