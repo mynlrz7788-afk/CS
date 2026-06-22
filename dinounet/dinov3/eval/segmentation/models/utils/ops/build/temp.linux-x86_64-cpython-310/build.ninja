@@ -1,0 +1,39 @@
+ninja_required_version = 1.3
+cxx = /home/u2508183004/.conda/envs/zyn_sam/bin/x86_64-conda-linux-gnu-g++
+nvcc = /usr/local/cuda/bin/nvcc
+
+cflags = -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /home/u2508183004/.conda/envs/zyn_sam/include -DNDEBUG -D_FORTIFY_SOURCE=2 -O2 -isystem /home/u2508183004/.conda/envs/zyn_sam/include -fPIC -DWITH_CUDA -I/home/u2508183004/zyn/SEG/dinounet/dinov3/eval/segmentation/models/utils/ops/src -I/home/u2508183004/.conda/envs/zyn_sam/lib/python3.10/site-packages/torch/include -I/home/u2508183004/.conda/envs/zyn_sam/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/home/u2508183004/.conda/envs/zyn_sam/include/python3.10 -c
+post_cflags = -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=MultiScaleDeformableAttention -std=c++17
+cuda_cflags = -DWITH_CUDA -I/home/u2508183004/zyn/SEG/dinounet/dinov3/eval/segmentation/models/utils/ops/src -I/home/u2508183004/.conda/envs/zyn_sam/lib/python3.10/site-packages/torch/include -I/home/u2508183004/.conda/envs/zyn_sam/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/home/u2508183004/.conda/envs/zyn_sam/include/python3.10 -c
+cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -DCUDA_HAS_FP16=1 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=MultiScaleDeformableAttention -gencode=arch=compute_80,code=compute_80 -gencode=arch=compute_80,code=sm_80 -ccbin /home/u2508183004/.conda/envs/zyn_sam/bin/x86_64-conda-linux-gnu-gcc -std=c++17
+cuda_dlink_post_cflags = 
+sycl_dlink_post_cflags = 
+ldflags = 
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+rule cuda_compile
+  depfile = $out.d
+  deps = gcc
+  command = $nvcc --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags
+
+
+
+
+
+
+
+build /home/u2508183004/zyn/SEG/dinounet/dinov3/eval/segmentation/models/utils/ops/build/temp.linux-x86_64-cpython-310/home/u2508183004/zyn/SEG/dinounet/dinov3/eval/segmentation/models/utils/ops/src/cpu/ms_deform_attn_cpu.o: compile /home/u2508183004/zyn/SEG/dinounet/dinov3/eval/segmentation/models/utils/ops/src/cpu/ms_deform_attn_cpu.cpp
+build /home/u2508183004/zyn/SEG/dinounet/dinov3/eval/segmentation/models/utils/ops/build/temp.linux-x86_64-cpython-310/home/u2508183004/zyn/SEG/dinounet/dinov3/eval/segmentation/models/utils/ops/src/cuda/ms_deform_attn_cuda.o: cuda_compile /home/u2508183004/zyn/SEG/dinounet/dinov3/eval/segmentation/models/utils/ops/src/cuda/ms_deform_attn_cuda.cu
+build /home/u2508183004/zyn/SEG/dinounet/dinov3/eval/segmentation/models/utils/ops/build/temp.linux-x86_64-cpython-310/home/u2508183004/zyn/SEG/dinounet/dinov3/eval/segmentation/models/utils/ops/src/vision.o: compile /home/u2508183004/zyn/SEG/dinounet/dinov3/eval/segmentation/models/utils/ops/src/vision.cpp
+
+
+
+
+
+
+
+
