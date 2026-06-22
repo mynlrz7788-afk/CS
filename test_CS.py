@@ -37,6 +37,45 @@ from dataloaders.road_dataset import RoadDataset
 from models import get_model
 
 
+
+
+def parse_input_size(input_size):
+    """
+    支持：
+    - 512 -> (512, 512)
+    - [320, 480] -> (320, 480)
+    - "320,480" / "320x480" -> (320, 480)
+    - {"height": 320, "width": 480} -> (320, 480)
+    返回顺序统一为 (H, W)。
+    """
+    if isinstance(input_size, int):
+        return int(input_size), int(input_size)
+
+    if isinstance(input_size, str):
+        s = input_size.lower().replace("x", ",").replace("*", ",")
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        if len(parts) == 1:
+            v = int(parts[0])
+            return v, v
+        if len(parts) == 2:
+            return int(parts[0]), int(parts[1])
+
+    if isinstance(input_size, (list, tuple)):
+        if len(input_size) == 1:
+            v = int(input_size[0])
+            return v, v
+        if len(input_size) == 2:
+            return int(input_size[0]), int(input_size[1])
+
+    if isinstance(input_size, dict):
+        h = input_size.get("height", input_size.get("h", None))
+        w = input_size.get("width", input_size.get("w", None))
+        if h is not None and w is not None:
+            return int(h), int(w)
+
+    raise ValueError(f"Unsupported input_size format: {input_size}")
+
+
 def parse_thresholds(text: str) -> List[float]:
     return [float(x.strip()) for x in str(text).split(",") if x.strip()]
 
@@ -104,8 +143,8 @@ def build_dataset(config: Dict[str, Any], mode: str):
     ds_cfg = config["dataset"]
     root = ds_cfg["root_path"]
     name = ds_cfg["name"]
-    img_size = int(ds_cfg.get("input_size", 1024))
-    return RoadDataset(root, name, mode=mode, img_size=img_size)
+    input_size = ds_cfg.get("input_size", 1024)
+    return RoadDataset(root, name, mode=mode, img_size=input_size)
 
 
 def unwrap_batch(batch_data):
@@ -281,9 +320,16 @@ def main():
         config = json.load(f)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    img_size = int(config["dataset"].get("input_size", 1024))
+    input_size = config["dataset"].get("input_size", 1024)
+    img_h, img_w = parse_input_size(input_size)
+    if img_h % 16 != 0 or img_w % 16 != 0:
+        raise ValueError(f"CS/RD/DINO 模型要求输入 H/W 能被 16 整除，当前 H={img_h}, W={img_w}")
 
-    model = get_model(config["model"], img_size=img_size).to(device)
+    try:
+        model = get_model(config["model"], img_size=input_size).to(device)
+    except TypeError:
+        # 兼容只接受 int img_size 的旧模型
+        model = get_model(config["model"], img_size=max(img_h, img_w)).to(device)
     set_model_return_aux(model, False)
     load_info = load_model_weights(
         model,
@@ -383,6 +429,7 @@ def main():
         "split": args.split,
         "model": get_model_name(config),
         "dataset": config["dataset"]["name"],
+        "input_size": {"height": img_h, "width": img_w},
         "load_info": {k: v for k, v in load_info.items() if k not in ("missing", "unexpected", "skipped")},
         "missing_count": len(load_info["missing"]),
         "unexpected_count": len(load_info["unexpected"]),
