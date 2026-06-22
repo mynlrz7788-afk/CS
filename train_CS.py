@@ -71,6 +71,50 @@ def seed_worker(worker_id: int):
     random.seed(worker_seed)
 
 
+
+
+def parse_input_size(input_size):
+    """
+    支持：
+    - 512 -> (512, 512)
+    - [320, 480] -> (320, 480)
+    - "320,480" / "320x480" -> (320, 480)
+    - {"height": 320, "width": 480} -> (320, 480)
+    返回顺序统一为 (H, W)。
+    """
+    if isinstance(input_size, int):
+        return int(input_size), int(input_size)
+
+    if isinstance(input_size, str):
+        s = input_size.lower().replace("x", ",").replace("*", ",")
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        if len(parts) == 1:
+            v = int(parts[0])
+            return v, v
+        if len(parts) == 2:
+            return int(parts[0]), int(parts[1])
+
+    if isinstance(input_size, (list, tuple)):
+        if len(input_size) == 1:
+            v = int(input_size[0])
+            return v, v
+        if len(input_size) == 2:
+            return int(input_size[0]), int(input_size[1])
+
+    if isinstance(input_size, dict):
+        h = input_size.get("height", input_size.get("h", None))
+        w = input_size.get("width", input_size.get("w", None))
+        if h is not None and w is not None:
+            return int(h), int(w)
+
+    raise ValueError(f"Unsupported input_size format: {input_size}")
+
+
+def format_input_size(input_size) -> str:
+    h, w = parse_input_size(input_size)
+    return f"{h}x{w}"
+
+
 def log_print(msg: str, log_file=None):
     print(msg, end="")
     if log_file is not None:
@@ -155,8 +199,8 @@ def build_dataset(config: Dict[str, Any], mode: str):
     ds_cfg = config["dataset"]
     root = ds_cfg["root_path"]
     name = ds_cfg["name"]
-    img_size = int(ds_cfg.get("input_size", 1024))
-    return RoadDataset(root, name, mode=mode, img_size=img_size)
+    input_size = ds_cfg.get("input_size", 1024)
+    return RoadDataset(root, name, mode=mode, img_size=input_size)
 
 
 def set_model_return_aux(model: nn.Module, enabled: bool):
@@ -728,13 +772,14 @@ class ProfileWrapper(nn.Module):
         return extract_logits(self.model(x))
 
 
-def evaluate_model_complexity(model: nn.Module, device: torch.device, img_size: int, log_file=None, enabled: bool = True):
+def evaluate_model_complexity(model: nn.Module, device: torch.device, img_size, log_file=None, enabled: bool = True):
     total, trainable, frozen = count_params(model)
     params, flops, fps = total, float("nan"), float("nan")
     if not enabled:
         return params, flops, fps
 
-    dummy = torch.randn(1, 3, img_size, img_size, device=device)
+    img_h, img_w = parse_input_size(img_size)
+    dummy = torch.randn(1, 3, img_h, img_w, device=device)
     was_training = model.training
     model.eval()
 
@@ -908,7 +953,12 @@ def main():
 
     ds_cfg = config["dataset"]
     dataset_name = ds_cfg["name"]
-    img_size = int(ds_cfg.get("input_size", 1024))
+    input_size = ds_cfg.get("input_size", 1024)
+    img_h, img_w = parse_input_size(input_size)
+    if img_h % 16 != 0 or img_w % 16 != 0:
+        raise ValueError(f"CS/RD/DINO 模型要求输入 H/W 能被 16 整除，当前 H={img_h}, W={img_w}")
+    if img_h % 32 != 0 or img_w % 32 != 0:
+        print(f"⚠️ 当前输入 H={img_h}, W={img_w} 不能被 32 整除，部分 CNN/decoder 可能需要插值对齐")
     train_dataset = build_dataset(config, mode="train")
     val_dataset = build_dataset(config, mode="val")
 
@@ -940,7 +990,11 @@ def main():
         generator=g,
     )
 
-    model = get_model(config["model"], img_size=img_size).to(device)
+    try:
+        model = get_model(config["model"], img_size=input_size).to(device)
+    except TypeError:
+        # 兼容只接受 int img_size 的旧模型
+        model = get_model(config["model"], img_size=max(img_h, img_w)).to(device)
     set_model_return_aux(model, True)
 
     if args.finetune:
@@ -973,13 +1027,13 @@ def main():
         log_print(f"  {r['module']:<24} total={r['total'] / 1e6:7.3f}M trainable={r['trainable'] / 1e6:7.3f}M frozen={r['frozen'] / 1e6:7.3f}M\n", log_file)
 
     profile_enabled = bool(train_cfg.get("profile_model", True))
-    params_prof, flops, fps = evaluate_model_complexity(model, device=device, img_size=img_size, log_file=log_file, enabled=profile_enabled)
+    params_prof, flops, fps = evaluate_model_complexity(model, device=device, img_size=input_size, log_file=log_file, enabled=profile_enabled)
     complexity_msg = (
         f"--------------------------------------------------\n"
-        f"📊 模型复杂度 @ 输入尺寸: {img_size}x{img_size}\n"
+        f"📊 模型复杂度 @ 输入尺寸: {img_h}x{img_w}\n"
         f"   - 参数量 Params:       {params_prof / 1e6:.2f} M\n"
         f"   - 浮点运算量 FLOPs:    {flops / 1e9:.2f} G\n" if math.isfinite(flops) else
-        f"--------------------------------------------------\n📊 模型复杂度 @ 输入尺寸: {img_size}x{img_size}\n   - 参数量 Params:       {params_prof / 1e6:.2f} M\n   - 浮点运算量 FLOPs:    统计失败/未启用\n"
+        f"--------------------------------------------------\n📊 模型复杂度 @ 输入尺寸: {img_h}x{img_w}\n   - 参数量 Params:       {params_prof / 1e6:.2f} M\n   - 浮点运算量 FLOPs:    统计失败/未启用\n"
     )
     complexity_msg += f"   - 推理速度 FPS:        {fps:.2f} 张/秒\n" if math.isfinite(fps) else "   - 推理速度 FPS:        统计失败/未启用\n"
     complexity_msg += "--------------------------------------------------\n"
