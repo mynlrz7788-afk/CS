@@ -1,0 +1,2133 @@
+import os
+import sys
+import importlib
+from typing import Dict, Tuple, List, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+__all__ = ["DC_v4_3"]
+
+
+def _auto_padding(kernel_size, dilation=1):
+    if isinstance(kernel_size, tuple):
+        if isinstance(dilation, tuple):
+            return tuple(((k - 1) // 2) * d for k, d in zip(kernel_size, dilation))
+        return tuple(((k - 1) // 2) * dilation for k in kernel_size)
+
+    return ((kernel_size - 1) // 2) * dilation
+
+
+def _make_gn(channels: int, max_groups: int = 8):
+    """GroupNorm helper. 对小 batch / 小特征图更稳。"""
+    channels = int(channels)
+    groups = min(int(max_groups), channels)
+
+    while groups > 1 and channels % groups != 0:
+        groups -= 1
+
+    return nn.GroupNorm(groups, channels)
+
+
+class ConvBNAct(nn.Module):
+    """
+    保持 HL_base / DC_v3 风格的 Conv-BN-ReLU。
+    主要用于 CNN decoder，保证和旧实验公平。
+    """
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=None,
+        dilation=1,
+        groups=1,
+        act_layer=nn.ReLU,
+        inplace=True,
+    ):
+        super().__init__()
+
+        if padding is None:
+            padding = _auto_padding(kernel_size, dilation)
+
+        if act_layer is nn.ReLU:
+            act = act_layer(inplace=inplace)
+        else:
+            act = act_layer()
+
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            act,
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class ConvGNAct(nn.Module):
+    """
+    DINO branch 专用 Conv-GN-GELU。
+    比 BatchNorm 更适合 128/256 小输入和小 batch。
+    """
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=None,
+        dilation=1,
+        groups=1,
+        act_layer=nn.GELU,
+        gn_groups=8,
+    ):
+        super().__init__()
+
+        if padding is None:
+            padding = _auto_padding(kernel_size, dilation)
+
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+                bias=False,
+            ),
+            _make_gn(out_channels, gn_groups),
+            act_layer(),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class ECALayer(nn.Module):
+    """
+    Efficient Channel Attention.
+    和 HL_base / DC_v3 保持一致。
+    """
+    def __init__(self, channels, k_size=3):
+        super().__init__()
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(
+            1,
+            1,
+            kernel_size=k_size,
+            padding=(k_size - 1) // 2,
+            bias=False,
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.conv(y.squeeze(-1).transpose(-1, -2))
+        y = self.sigmoid(y.transpose(-1, -2).unsqueeze(-1))
+        return x * y.expand_as(x)
+
+
+class ResidualDecoderBlock(nn.Module):
+    """
+    HL_base 风格残差解码块：
+        upsample decoder feature
+        -> concat skip
+        -> 2×ConvBNAct
+        -> ECA
+        -> shortcut
+        -> residual add
+        -> ReLU
+    """
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super().__init__()
+
+        self.fuse = nn.Sequential(
+            ConvBNAct(in_channels + skip_channels, out_channels, kernel_size=3),
+            ConvBNAct(out_channels, out_channels, kernel_size=3),
+        )
+
+        self.eca = ECALayer(out_channels)
+
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(
+                in_channels + skip_channels,
+                out_channels,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+        )
+
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x, skip):
+        x = F.interpolate(
+            x,
+            size=skip.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        feat = torch.cat([x, skip], dim=1)
+
+        out = self.fuse(feat)
+        out = self.eca(out)
+        out = out + self.shortcut(feat)
+
+        return self.act(out)
+
+
+class FrozenDINOv3TokenExtractor(nn.Module):
+    """
+    Frozen DINOv3 token extractor.
+
+    严格按文档思路：
+        Input image
+        -> Frozen DINOv3
+        -> T2/T5/T8/T11 token sequence
+
+    输出:
+        {
+            layer_id: B × N × C
+        }
+
+    其中:
+        N = H/patch_size × W/patch_size
+
+    注意:
+        1. DINO 原始参数全部冻结。
+        2. forward 使用 no_grad。
+        3. 优先取 reshape=False 的 token sequence。
+        4. 如果某些 DINOv3 版本返回 4D feature map，则自动 flatten 回 token。
+    """
+    def __init__(
+        self,
+        dino_model_name="dinov3_vits16",
+        dino_repo_path="/home/u2508183004/zyn/SEG/dinounet/dinov3",
+        dino_ckpt_path="/home/u2508183004/zyn/SEG/weight/dinov3/dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+        out_layers=(2, 5, 8, 11),
+        embed_dim=384,
+        patch_size=16,
+        dino_normalize=False,
+        dino_intermediate_norm=False,
+    ):
+        super().__init__()
+
+        self.dino_model_name = dino_model_name
+        self.dino_repo_path = dino_repo_path
+        self.dino_ckpt_path = dino_ckpt_path
+        self.out_layers = list(out_layers)
+        self.embed_dim = int(embed_dim)
+        self.patch_size = int(patch_size)
+        self.dino_normalize = bool(dino_normalize)
+        self.dino_intermediate_norm = bool(dino_intermediate_norm)
+
+        self.register_buffer(
+            "mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+        self.backbone = self._build_dino_backbone()
+        self._freeze_backbone()
+
+        print(
+            "[DC_v4_3] Frozen DINOv3 token extractor ready. "
+            f"out_layers={self.out_layers}, patch_size={self.patch_size}"
+        )
+
+    def _build_dino_backbone(self):
+        if not os.path.isdir(self.dino_repo_path):
+            raise FileNotFoundError(f"找不到 dino_repo_path: {self.dino_repo_path}")
+
+        dinov3_parent = os.path.dirname(self.dino_repo_path)
+
+        if dinov3_parent not in sys.path:
+            sys.path.insert(0, dinov3_parent)
+
+        try:
+            backbones = importlib.import_module("dinov3.hub.backbones")
+        except Exception as e:
+            raise ImportError(
+                "导入 dinov3.hub.backbones 失败。请确认 dino_repo_path 指向 "
+                ".../SEG/dinounet/dinov3。\n"
+                f"原始错误: {repr(e)}"
+            )
+
+        if not hasattr(backbones, self.dino_model_name):
+            available = [n for n in dir(backbones) if n.startswith("dinov3_")]
+            raise AttributeError(
+                f"在 dinov3.hub.backbones 中找不到模型: {self.dino_model_name}\n"
+                f"可用模型示例: {available[:30]}"
+            )
+
+        model = getattr(backbones, self.dino_model_name)(pretrained=False)
+
+        if self.dino_ckpt_path is not None and self.dino_ckpt_path != "":
+            if not os.path.isfile(self.dino_ckpt_path):
+                raise FileNotFoundError(f"找不到 DINOv3 权重文件: {self.dino_ckpt_path}")
+
+            ckpt = torch.load(self.dino_ckpt_path, map_location="cpu")
+
+            if isinstance(ckpt, dict):
+                if "model" in ckpt:
+                    state_dict = ckpt["model"]
+                elif "state_dict" in ckpt:
+                    state_dict = ckpt["state_dict"]
+                elif "teacher" in ckpt:
+                    state_dict = ckpt["teacher"]
+                else:
+                    state_dict = ckpt
+            else:
+                state_dict = ckpt
+
+            clean_state = {}
+
+            for k, v in state_dict.items():
+                nk = k
+
+                for prefix in (
+                    "module.",
+                    "backbone.",
+                    "student.",
+                    "teacher.",
+                    "model.",
+                ):
+                    if nk.startswith(prefix):
+                        nk = nk[len(prefix):]
+
+                clean_state[nk] = v
+
+            missing, unexpected = model.load_state_dict(clean_state, strict=False)
+
+            print(
+                f"[DC_v4_3] 加载 DINOv3 权重完成: {self.dino_ckpt_path}\n"
+                f"          missing_keys={len(missing)}, unexpected_keys={len(unexpected)}"
+            )
+
+            if len(missing) > 0:
+                print(f"          missing 示例: {missing[:10]}")
+            if len(unexpected) > 0:
+                print(f"          unexpected 示例: {unexpected[:10]}")
+
+        return model
+
+    def _freeze_backbone(self):
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+        self.backbone.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.backbone.eval()
+        return self
+
+    @staticmethod
+    def _feat_to_tokens(feat, h, w, patch_size):
+        if isinstance(feat, (tuple, list)):
+            feat = feat[0]
+
+        patch_h = h // patch_size
+        patch_w = w // patch_size
+        patch_n = patch_h * patch_w
+
+        if feat.dim() == 4:
+            # B × C × Hp × Wp -> B × N × C
+            b, c, fh, fw = feat.shape
+
+            if (fh, fw) != (patch_h, patch_w):
+                feat = F.interpolate(
+                    feat,
+                    size=(patch_h, patch_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+            tokens = feat.flatten(2).transpose(1, 2).contiguous()
+            return tokens
+
+        if feat.dim() != 3:
+            raise RuntimeError(f"DINO 特征维度异常: {feat.shape}")
+
+        b, n, c = feat.shape
+
+        # 如果含 cls/register token，只保留最后 patch_n 个 patch tokens。
+        if n > patch_n:
+            special_n = n - patch_n
+            feat = feat[:, special_n:, :]
+
+        if feat.shape[1] != patch_n:
+            raise RuntimeError(
+                f"DINO token 无法对齐 patch grid。"
+                f"当前 token 数={feat.shape[1]}, 预期 patch 数={patch_n}, "
+                f"输入尺寸={h}x{w}, patch_size={patch_size}"
+            )
+
+        return feat.contiguous()
+
+    @torch.no_grad()
+    def forward(self, x):
+        if self.dino_normalize:
+            x = (x - self.mean) / self.std
+
+        _, _, h, w = x.shape
+
+        if h % self.patch_size != 0 or w % self.patch_size != 0:
+            raise RuntimeError(
+                f"DINO 输入尺寸必须能被 patch_size 整除。"
+                f"当前输入: {h}x{w}, patch_size={self.patch_size}"
+            )
+
+        if not hasattr(self.backbone, "get_intermediate_layers"):
+            raise RuntimeError(
+                "当前 DINOv3 backbone 没有 get_intermediate_layers。"
+                "请检查 dinounet/dinov3/models/vision_transformer.py。"
+            )
+
+        try:
+            feats = self.backbone.get_intermediate_layers(
+                x,
+                n=self.out_layers,
+                reshape=False,
+                return_class_token=False,
+                norm=self.dino_intermediate_norm,
+            )
+        except TypeError:
+            try:
+                feats = self.backbone.get_intermediate_layers(
+                    x,
+                    n=self.out_layers,
+                    reshape=False,
+                    return_class_token=False,
+                )
+            except TypeError:
+                # 兜底：部分版本不支持 reshape=False，就先取 2D feature 再 flatten。
+                feats = self.backbone.get_intermediate_layers(
+                    x,
+                    n=self.out_layers,
+                    reshape=True,
+                    return_class_token=False,
+                )
+
+        if isinstance(feats, torch.Tensor):
+            feats = [feats]
+
+        feats = list(feats)
+
+        if len(feats) != len(self.out_layers):
+            raise RuntimeError(
+                f"DINO 输出层数不匹配。期望 {len(self.out_layers)} 层，"
+                f"实际得到 {len(feats)} 层。"
+            )
+
+        outputs = {}
+
+        for layer, feat in zip(self.out_layers, feats):
+            tokens = self._feat_to_tokens(
+                feat,
+                h=h,
+                w=w,
+                patch_size=self.patch_size,
+            )
+            outputs[int(layer)] = tokens
+
+        return outputs
+
+
+class TokenSemanticCalibration(nn.Module):
+    """
+    Token Semantic Calibration.
+
+    T_l:
+        B × N × C
+    输出:
+        T_l + alpha · MLP(LN(T_l))
+
+    alpha 初始很小，避免一开始破坏 frozen DINO 表征。
+    """
+    def __init__(
+        self,
+        embed_dim=384,
+        bottleneck=64,
+        alpha_init=0.01,
+        dropout=0.0,
+    ):
+        super().__init__()
+
+        self.norm = nn.LayerNorm(embed_dim)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, bottleneck, bias=False),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(bottleneck, embed_dim, bias=False),
+        )
+
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # 最后一层零初始化，使初始接近恒等映射。
+        last = self.mlp[-1]
+        nn.init.zeros_(last.weight)
+
+    def forward(self, tokens):
+        delta = self.mlp(self.norm(tokens))
+        return tokens + self.alpha * delta
+
+
+class StructureQueryBridge(nn.Module):
+    """
+    Structure Query Bridge.
+
+    用一组 learnable queries 从 DINO token 中读取结构信息:
+        Q_global / Q_connect / Q_boundary / Q_suppress
+
+    输入:
+        T_l_calib: B × N × C
+
+    输出:
+        Z_l: B × num_queries × C
+
+    默认 num_queries=32，四组各 8 个 query。
+    对 128×128 小输入，可以在 json 中设置 structure_queries=16。
+    """
+    def __init__(
+        self,
+        embed_dim=384,
+        num_queries=32,
+        num_heads=8,
+        mlp_ratio=2.0,
+        dropout=0.0,
+    ):
+        super().__init__()
+
+        if num_queries % 4 != 0:
+            raise ValueError(
+                f"structure_queries 必须能被 4 整除，当前为 {num_queries}"
+            )
+
+        if embed_dim % num_heads != 0:
+            raise ValueError(
+                f"embed_dim 必须能被 num_heads 整除。"
+                f"当前 embed_dim={embed_dim}, num_heads={num_heads}"
+            )
+
+        self.embed_dim = int(embed_dim)
+        self.num_queries = int(num_queries)
+
+        self.structure_queries = nn.Parameter(
+            torch.zeros(1, num_queries, embed_dim)
+        )
+
+        self.q_norm = nn.LayerNorm(embed_dim)
+        self.kv_norm = nn.LayerNorm(embed_dim)
+
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        hidden = int(embed_dim * mlp_ratio)
+
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, hidden, bias=False),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, embed_dim, bias=False),
+        )
+
+        self.gamma_attn = nn.Parameter(torch.tensor(1.0))
+        self.gamma_ffn = nn.Parameter(torch.tensor(1.0))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.trunc_normal_(self.structure_queries, std=0.02)
+        last = self.ffn[-1]
+        nn.init.zeros_(last.weight)
+
+    def forward(self, tokens):
+        b = tokens.shape[0]
+
+        q = self.structure_queries.expand(b, -1, -1)
+        q_norm = self.q_norm(q)
+        kv = self.kv_norm(tokens)
+
+        attn_out, _ = self.attn(
+            query=q_norm,
+            key=kv,
+            value=kv,
+            need_weights=False,
+        )
+
+        z = q + self.gamma_attn * attn_out
+        z = z + self.gamma_ffn * self.ffn(z)
+
+        return z
+
+
+class DirectionalGridMixer(nn.Module):
+    """
+    Grid Directional Mixing.
+
+    在 DINO patch grid 上做道路方向结构混合：
+        horizontal: 1×k
+        vertical:   k×1
+        diagonal:   3×3 dilation=2
+        local:      3×3
+
+    输入 / 输出:
+        B × C × Hp × Wp
+    """
+    def __init__(
+        self,
+        channels=128,
+        kernel_size=7,
+        beta_init=0.1,
+        gn_groups=8,
+    ):
+        super().__init__()
+
+        padding = (kernel_size - 1) // 2
+
+        self.branch_h = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=(1, kernel_size),
+            padding=(0, padding),
+            groups=channels,
+            bias=False,
+        )
+
+        self.branch_v = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=(kernel_size, 1),
+            padding=(padding, 0),
+            groups=channels,
+            bias=False,
+        )
+
+        self.branch_d = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=2,
+            dilation=2,
+            groups=channels,
+            bias=False,
+        )
+
+        self.branch_l = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=1,
+            groups=channels,
+            bias=False,
+        )
+
+        self.fuse = nn.Sequential(
+            nn.Conv2d(channels * 4, channels, kernel_size=1, bias=False),
+            _make_gn(channels, gn_groups),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            _make_gn(channels, gn_groups),
+        )
+
+        self.act = nn.GELU()
+        self.beta = nn.Parameter(torch.tensor(float(beta_init)))
+
+    def forward(self, x):
+        h = self.branch_h(x)
+        v = self.branch_v(x)
+        d = self.branch_d(x)
+        l = self.branch_l(x)
+
+        y = torch.cat([h, v, d, l], dim=1)
+        y = self.fuse(y)
+
+        return self.act(x + self.beta * y)
+
+
+class TokenLayerAdapter(nn.Module):
+    """
+    单个 DINO 层的 Token-Structure Adapter。
+
+    T_l
+    -> Token Semantic Calibration
+    -> Token-to-Grid
+    -> 1×1 projection
+    -> Grid Directional Mixing
+    -> A_l
+    """
+    def __init__(
+        self,
+        embed_dim=384,
+        token_bottleneck=64,
+        adapter_channels=128,
+        alpha_init=0.01,
+        beta_init=0.1,
+        dropout=0.0,
+        gn_groups=8,
+    ):
+        super().__init__()
+
+        self.embed_dim = int(embed_dim)
+        self.adapter_channels = int(adapter_channels)
+
+        self.calibration = TokenSemanticCalibration(
+            embed_dim=embed_dim,
+            bottleneck=token_bottleneck,
+            alpha_init=alpha_init,
+            dropout=dropout,
+        )
+
+        self.proj = ConvGNAct(
+            embed_dim,
+            adapter_channels,
+            kernel_size=1,
+            padding=0,
+            gn_groups=gn_groups,
+        )
+
+        self.grid_mixer = DirectionalGridMixer(
+            channels=adapter_channels,
+            kernel_size=7,
+            beta_init=beta_init,
+            gn_groups=gn_groups,
+        )
+
+    @staticmethod
+    def _tokens_to_grid(tokens, patch_hw):
+        b, n, c = tokens.shape
+        hp, wp = patch_hw
+
+        if n != hp * wp:
+            raise RuntimeError(
+                f"Token 数和 patch grid 不匹配: tokens={n}, patch_hw={patch_hw}"
+            )
+
+        grid = tokens.transpose(1, 2).contiguous().view(b, c, hp, wp)
+
+        return grid
+
+    def forward(self, tokens, patch_hw):
+        t_calib = self.calibration(tokens)
+
+        grid = self._tokens_to_grid(t_calib, patch_hw)
+        grid = self.proj(grid)
+        a = self.grid_mixer(grid)
+
+        return a, t_calib
+
+
+class DinoStructurePyramid(nn.Module):
+    """
+    文档版 DINO structure pyramid。
+
+    输入:
+        T2/T5/T8/T11
+
+    输出:
+        A2/A5/A8/A11:
+            B × adapter_channels × Hp × Wp
+
+        Z2/Z5/Z8/Z11:
+            B × structure_queries × embed_dim
+    """
+    def __init__(
+        self,
+        dino_layers=(2, 5, 8, 11),
+        embed_dim=384,
+        token_bottleneck=64,
+        adapter_channels=128,
+        structure_queries=32,
+        structure_heads=8,
+        structure_mlp_ratio=2.0,
+        adapter_alpha_init=0.01,
+        adapter_beta_init=0.1,
+        dropout=0.0,
+        gn_groups=8,
+    ):
+        super().__init__()
+
+        self.dino_layers = [int(x) for x in dino_layers]
+
+        self.layer_adapters = nn.ModuleDict()
+
+        for layer in self.dino_layers:
+            key = str(layer)
+
+            self.layer_adapters[key] = TokenLayerAdapter(
+                embed_dim=embed_dim,
+                token_bottleneck=token_bottleneck,
+                adapter_channels=adapter_channels,
+                alpha_init=adapter_alpha_init,
+                beta_init=adapter_beta_init,
+                dropout=dropout,
+                gn_groups=gn_groups,
+            )
+
+        # 共享结构 queries，保证 global/connect/boundary/suppress 语义在层间对齐。
+        self.query_bridge = StructureQueryBridge(
+            embed_dim=embed_dim,
+            num_queries=structure_queries,
+            num_heads=structure_heads,
+            mlp_ratio=structure_mlp_ratio,
+            dropout=dropout,
+        )
+
+    def forward(self, token_dict: Dict[int, torch.Tensor], patch_hw: Tuple[int, int]):
+        a_dict = {}
+        z_dict = {}
+
+        for layer in self.dino_layers:
+            if layer not in token_dict:
+                raise KeyError(
+                    f"DINO token 输出中缺少 layer={layer}。"
+                    f"当前 keys={list(token_dict.keys())}"
+                )
+
+            key = str(layer)
+
+            a, t_calib = self.layer_adapters[key](
+                token_dict[layer],
+                patch_hw=patch_hw,
+            )
+
+            z = self.query_bridge(t_calib)
+
+            a_dict[layer] = a
+            z_dict[layer] = z
+
+        return a_dict, z_dict
+
+
+class StageAwareRouter(nn.Module):
+    """
+    Stage-aware layer router.
+
+    输入:
+        A_stack: B × L × C × Hp × Wp
+        Z_dict:  每层 B × Q × D
+
+    输出:
+        R_stage: B × C × Hp × Wp
+        W_stage: B × L × C × Hp × Wp
+
+    W_stage = softmax(P + C + S + Q, dim=1)
+    """
+    def __init__(
+        self,
+        stage: str,
+        dino_layers=(2, 5, 8, 11),
+        adapter_channels=128,
+        embed_dim=384,
+        structure_queries=32,
+        router_hidden=512,
+        logit_scale_init=0.1,
+    ):
+        super().__init__()
+
+        stage = str(stage)
+
+        if stage not in ("16", "8", "4"):
+            raise ValueError(f"stage 必须是 '16' / '8' / '4'，当前为 {stage}")
+
+        if structure_queries % 4 != 0:
+            raise ValueError(
+                f"structure_queries 必须能被 4 整除，当前为 {structure_queries}"
+            )
+
+        self.stage = stage
+        self.dino_layers = [int(x) for x in dino_layers]
+        self.num_layers = len(self.dino_layers)
+        self.adapter_channels = int(adapter_channels)
+        self.embed_dim = int(embed_dim)
+        self.structure_queries = int(structure_queries)
+        self.group_queries = self.structure_queries // 4
+
+        if self.stage == "16":
+            prior = [0.05, 0.15, 0.40, 0.40]
+        elif self.stage == "8":
+            prior = [0.10, 0.30, 0.40, 0.20]
+        else:
+            prior = [0.35, 0.35, 0.20, 0.10]
+
+        if len(prior) != self.num_layers:
+            raise ValueError(
+                f"当前 prior 长度={len(prior)}，但 dino_layers 数量={self.num_layers}。"
+                "如果改了 dino_layers，需要同步修改 StageAwareRouter 的 prior。"
+            )
+
+        prior_tensor = torch.tensor(prior, dtype=torch.float32).view(
+            1,
+            self.num_layers,
+            1,
+            1,
+            1,
+        )
+
+        self.stage_prior = nn.Parameter(torch.log(prior_tensor))
+
+        channel_in = self.num_layers * self.adapter_channels
+        channel_hidden = max(int(router_hidden), self.adapter_channels)
+
+        self.channel_mlp = nn.Sequential(
+            nn.LayerNorm(channel_in),
+            nn.Linear(channel_in, channel_hidden, bias=False),
+            nn.GELU(),
+            nn.Linear(channel_hidden, self.num_layers * self.adapter_channels),
+        )
+
+        self.spatial_score = nn.ModuleList([
+            nn.Conv2d(self.adapter_channels, 1, kernel_size=1, bias=True)
+            for _ in range(self.num_layers)
+        ])
+
+        if self.stage == "4":
+            query_in = self.num_layers * self.embed_dim * 2
+        else:
+            query_in = self.num_layers * self.embed_dim
+
+        query_hidden = max(int(router_hidden), self.embed_dim)
+
+        self.query_mlp = nn.Sequential(
+            nn.LayerNorm(query_in),
+            nn.Linear(query_in, query_hidden, bias=False),
+            nn.GELU(),
+            nn.Linear(query_hidden, self.num_layers * self.adapter_channels),
+        )
+
+        # 小尺度初始化，让 prior 先发挥作用，训练中逐渐学习动态路由。
+        self.scale_channel = nn.Parameter(torch.tensor(float(logit_scale_init)))
+        self.scale_spatial = nn.Parameter(torch.tensor(float(logit_scale_init)))
+        self.scale_query = nn.Parameter(torch.tensor(float(logit_scale_init)))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.zeros_(self.channel_mlp[-1].weight)
+        nn.init.zeros_(self.channel_mlp[-1].bias)
+        nn.init.zeros_(self.query_mlp[-1].weight)
+        nn.init.zeros_(self.query_mlp[-1].bias)
+
+        for conv in self.spatial_score:
+            nn.init.zeros_(conv.weight)
+            nn.init.zeros_(conv.bias)
+
+    def _extract_query_vector(self, z_dict: Dict[int, torch.Tensor]):
+        """
+        Z_l 分组:
+            0: group       global
+            1: group       connect
+            2: group       boundary
+            3: group       suppress
+        """
+        vecs = []
+
+        g = self.group_queries
+
+        for layer in self.dino_layers:
+            if layer not in z_dict:
+                raise KeyError(
+                    f"Z_dict 中缺少 layer={layer}。当前 keys={list(z_dict.keys())}"
+                )
+
+            z = z_dict[layer]
+
+            if z.shape[1] != self.structure_queries:
+                raise RuntimeError(
+                    f"Structure query 数量不匹配。"
+                    f"期望 {self.structure_queries}, 实际 {z.shape[1]}"
+                )
+
+            z_global = z[:, 0:g, :].mean(dim=1)
+            z_connect = z[:, g:2 * g, :].mean(dim=1)
+            z_boundary = z[:, 2 * g:3 * g, :].mean(dim=1)
+            z_suppress = z[:, 3 * g:4 * g, :].mean(dim=1)
+
+            if self.stage == "16":
+                vecs.append(z_global)
+            elif self.stage == "8":
+                vecs.append(z_connect)
+            else:
+                vecs.append(torch.cat([z_boundary, z_suppress], dim=1))
+
+        return torch.cat(vecs, dim=1)
+
+    def forward(self, a_stack: torch.Tensor, z_dict: Dict[int, torch.Tensor]):
+        b, l, c, hp, wp = a_stack.shape
+
+        if l != self.num_layers:
+            raise RuntimeError(
+                f"A_stack layer 数不匹配。期望 {self.num_layers}, 实际 {l}"
+            )
+
+        if c != self.adapter_channels:
+            raise RuntimeError(
+                f"A_stack channel 不匹配。期望 {self.adapter_channels}, 实际 {c}"
+            )
+
+        # Channel routing: B × L × C × 1 × 1
+        channel_desc = a_stack.mean(dim=(-1, -2)).reshape(b, l * c)
+        channel_logits = self.channel_mlp(channel_desc)
+        channel_logits = channel_logits.view(b, l, c, 1, 1)
+
+        # Spatial routing: B × L × 1 × Hp × Wp
+        spatial_logits = []
+
+        for i in range(l):
+            spatial_logits.append(self.spatial_score[i](a_stack[:, i]))
+
+        spatial_logits = torch.stack(spatial_logits, dim=1)
+
+        # Query routing: B × L × C × 1 × 1
+        query_vec = self._extract_query_vector(z_dict)
+        query_logits = self.query_mlp(query_vec)
+        query_logits = query_logits.view(b, l, c, 1, 1)
+
+        logits = (
+            self.stage_prior
+            + self.scale_channel * channel_logits
+            + self.scale_spatial * spatial_logits
+            + self.scale_query * query_logits
+        )
+
+        weights = torch.softmax(logits, dim=1)
+        routed = (weights * a_stack).sum(dim=1)
+
+        return routed, weights
+
+
+class ResidualRefineGN(nn.Module):
+    """
+    DINO guidance projection 中的轻量 residual refinement。
+    注意：此处保持 DC_v4_1 原始普通卷积版本，不做 lite 压缩。
+    """
+    def __init__(self, channels, gn_groups=8):
+        super().__init__()
+
+        self.conv1 = ConvGNAct(
+            channels,
+            channels,
+            kernel_size=3,
+            gn_groups=gn_groups,
+        )
+
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            _make_gn(channels, gn_groups),
+        )
+
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        y = self.conv1(x)
+        y = self.conv2(y)
+        return self.act(x + y)
+
+
+class StageProjectionHead(nn.Module):
+    """
+    R16/R8/R4 -> G16/G8/G4.
+
+    G16 对齐 x3: H/16, 256 channels
+    G8  对齐 x2: H/8,  128 channels
+    G4  对齐 x1: H/4,  64 channels
+
+    所有 spatial size 都用 target_size 动态对齐，不写死 64/128/256。
+    """
+    def __init__(
+        self,
+        in_channels=128,
+        g16_channels=256,
+        g8_channels=128,
+        g4_channels=64,
+        gn_groups=8,
+    ):
+        super().__init__()
+
+        self.g16_proj = nn.Sequential(
+            ConvGNAct(
+                in_channels,
+                g16_channels,
+                kernel_size=1,
+                padding=0,
+                gn_groups=gn_groups,
+            ),
+            DirectionalGridMixer(
+                channels=g16_channels,
+                kernel_size=7,
+                beta_init=0.1,
+                gn_groups=gn_groups,
+            ),
+            ResidualRefineGN(g16_channels, gn_groups=gn_groups),
+        )
+
+        self.g8_proj = ConvGNAct(
+            in_channels,
+            g8_channels,
+            kernel_size=1,
+            padding=0,
+            gn_groups=gn_groups,
+        )
+
+        self.g8_refine = nn.Sequential(
+            ResidualRefineGN(g8_channels, gn_groups=gn_groups),
+            DirectionalGridMixer(
+                channels=g8_channels,
+                kernel_size=7,
+                beta_init=0.1,
+                gn_groups=gn_groups,
+            ),
+        )
+
+        self.g4_proj = ConvGNAct(
+            in_channels,
+            g4_channels,
+            kernel_size=1,
+            padding=0,
+            gn_groups=gn_groups,
+        )
+
+        self.g4_refine8 = ResidualRefineGN(
+            g4_channels,
+            gn_groups=gn_groups,
+        )
+
+        self.g4_refine4 = nn.Sequential(
+            ResidualRefineGN(g4_channels, gn_groups=gn_groups),
+            DirectionalGridMixer(
+                channels=g4_channels,
+                kernel_size=7,
+                beta_init=0.1,
+                gn_groups=gn_groups,
+            ),
+        )
+
+    @staticmethod
+    def _resize(x, size):
+        if x.shape[-2:] == size:
+            return x
+
+        return F.interpolate(
+            x,
+            size=size,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+    def forward(
+        self,
+        r16,
+        r8,
+        r4,
+        target16: Tuple[int, int],
+        target8: Tuple[int, int],
+        target4: Tuple[int, int],
+    ):
+        g16 = self.g16_proj(r16)
+        g16 = self._resize(g16, target16)
+
+        g8 = self.g8_proj(r8)
+        g8 = self._resize(g8, target8)
+        g8 = self.g8_refine(g8)
+
+        g4 = self.g4_proj(r4)
+        g4 = self._resize(g4, target8)
+        g4 = self.g4_refine8(g4)
+        g4 = self._resize(g4, target4)
+        g4 = self.g4_refine4(g4)
+
+        return g16, g8, g4
+
+
+class SimpleDinoInjector(nn.Module):
+    """
+    极简 CNN-DINO interaction:
+        x_hat = x + gamma · refine(G)
+
+    与 DC_v4_1 保持一致。
+    不做 Cross-Attention / DCA / Mutual Guidance。
+    """
+    def __init__(
+        self,
+        channels,
+        gamma_init=0.1,
+        gn_groups=8,
+    ):
+        super().__init__()
+
+        self.refine = ResidualRefineGN(
+            channels,
+            gn_groups=gn_groups,
+        )
+
+        self.gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+
+    def forward(self, x, g):
+        if g.shape[-2:] != x.shape[-2:]:
+            g = F.interpolate(
+                g,
+                size=x.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        return x + self.gamma * self.refine(g)
+
+
+
+def _import_ms_deform_attn(dino_repo_path: Optional[str] = None):
+    """
+    动态导入 Dino U-Net / DINOv3 中的 MSDeformAttn。
+
+    兼容两类常见目录：
+        1. /path/to/dinounet/dinov3  -> import dinov3.eval....ms_deform_attn
+        2. /path/to/dinounet         -> import dinounet.dinov3.eval....ms_deform_attn
+
+    训练时建议确认 MultiScaleDeformableAttention CUDA 扩展已经编译，
+    否则 backward 会报错。
+    """
+    if dino_repo_path:
+        dino_repo_path = os.path.abspath(dino_repo_path)
+        candidates = [
+            os.path.dirname(dino_repo_path),
+            os.path.dirname(os.path.dirname(dino_repo_path)),
+            dino_repo_path,
+        ]
+        for cand in candidates:
+            if cand and os.path.isdir(cand) and cand not in sys.path:
+                sys.path.insert(0, cand)
+
+    module_names = [
+        "dinov3.eval.segmentation.models.utils.ms_deform_attn",
+        "dinounet.dinov3.eval.segmentation.models.utils.ms_deform_attn",
+    ]
+
+    last_error = None
+    for name in module_names:
+        try:
+            module = importlib.import_module(name)
+            if hasattr(module, "MSDeformAttn"):
+                return module.MSDeformAttn
+        except Exception as e:
+            last_error = e
+
+    raise ImportError(
+        "导入 MSDeformAttn 失败。请确认 Dino U-Net / DINOv3 的 "
+        "dinov3/eval/segmentation/models/utils/ms_deform_attn.py 可导入，"
+        "并且 MultiScaleDeformableAttention CUDA 扩展已编译。\n"
+        f"最后一次错误: {repr(last_error)}"
+    )
+
+
+def _make_level_start_index(spatial_shapes: torch.Tensor):
+    """spatial_shapes: L × 2, long tensor."""
+    return torch.cat(
+        (
+            spatial_shapes.new_zeros((1,)),
+            spatial_shapes.prod(1).cumsum(0)[:-1],
+        )
+    )
+
+
+def _make_reference_points(batch_size: int, height: int, width: int, n_levels: int, device, dtype):
+    """
+    生成 MSDeformAttn 需要的 reference_points。
+
+    输出:
+        B × (H·W) × L × 2
+    坐标范围 [0, 1]，顺序为 (x, y)。
+    """
+    y, x = torch.meshgrid(
+        torch.linspace(0.5, height - 0.5, height, dtype=torch.float32, device=device),
+        torch.linspace(0.5, width - 0.5, width, dtype=torch.float32, device=device),
+        indexing="ij",
+    )
+    ref = torch.stack((x.reshape(-1) / width, y.reshape(-1) / height), dim=-1)
+    ref = ref.view(1, height * width, 1, 2).repeat(batch_size, 1, n_levels, 1)
+    return ref.to(dtype=dtype)
+
+
+class MultiScaleFeatureProjector(nn.Module):
+    """
+    将多尺度 2D feature map 投影成 MSDeformAttn 的 value token。
+
+    输入:
+        feats = [B×C1×H1×W1, B×C2×H2×W2, ...]
+
+    输出:
+        value_flatten:       B × sum(Hi·Wi) × d_model
+        spatial_shapes:      L × 2
+        level_start_index:   L
+    """
+    def __init__(
+        self,
+        in_channels_list: List[int],
+        d_model: int,
+        gn_groups: int = 8,
+    ):
+        super().__init__()
+        self.in_channels_list = [int(c) for c in in_channels_list]
+        self.d_model = int(d_model)
+        self.projs = nn.ModuleList([
+            ConvGNAct(
+                in_channels=c,
+                out_channels=self.d_model,
+                kernel_size=1,
+                padding=0,
+                gn_groups=gn_groups,
+            )
+            for c in self.in_channels_list
+        ])
+
+    def forward(self, feats: List[torch.Tensor]):
+        if len(feats) != len(self.projs):
+            raise RuntimeError(
+                f"MultiScaleFeatureProjector 输入尺度数错误: "
+                f"期望 {len(self.projs)}, 实际 {len(feats)}"
+            )
+
+        flatten_list = []
+        shape_list = []
+
+        for feat, proj in zip(feats, self.projs):
+            y = proj(feat)
+            b, c, h, w = y.shape
+            flatten_list.append(y.flatten(2).transpose(1, 2).contiguous())
+            shape_list.append((h, w))
+
+        value_flatten = torch.cat(flatten_list, dim=1)
+        spatial_shapes = torch.as_tensor(
+            shape_list,
+            dtype=torch.long,
+            device=value_flatten.device,
+        )
+        level_start_index = _make_level_start_index(spatial_shapes)
+
+        return value_flatten, spatial_shapes, level_start_index
+
+
+class HaarHighFrequencyDetail(nn.Module):
+    """
+    SFFNet-style 高频细节分支。
+
+    不依赖 pytorch_wavelets，使用固定 Haar high-frequency filters：
+        LH / HL / HH
+    只建议放在 H/4 的 x1-G4 交互处，用来补足 G4 上采样带来的边界细节不足。
+    """
+    def __init__(self, channels: int, gn_groups: int = 8):
+        super().__init__()
+        self.channels = int(channels)
+
+        # Haar high-frequency filters, shape = 3 × 1 × 2 × 2
+        lh = torch.tensor([[1.0, 1.0], [-1.0, -1.0]]) * 0.5
+        hl = torch.tensor([[1.0, -1.0], [1.0, -1.0]]) * 0.5
+        hh = torch.tensor([[1.0, -1.0], [-1.0, 1.0]]) * 0.5
+        weight = torch.stack([lh, hl, hh], dim=0).view(3, 1, 2, 2)
+        weight = weight.repeat(self.channels, 1, 1, 1)  # 3C × 1 × 2 × 2
+        self.register_buffer("haar_hf_weight", weight, persistent=False)
+
+        self.fuse = nn.Sequential(
+            ConvGNAct(3 * self.channels, self.channels, kernel_size=1, padding=0, gn_groups=gn_groups),
+            ConvGNAct(self.channels, self.channels, kernel_size=3, gn_groups=gn_groups),
+        )
+
+        # 道路方向细节：水平 + 垂直 + 斜向近似
+        self.dir_h = nn.Conv2d(self.channels, self.channels, kernel_size=(1, 7), padding=(0, 3), groups=self.channels, bias=False)
+        self.dir_v = nn.Conv2d(self.channels, self.channels, kernel_size=(7, 1), padding=(3, 0), groups=self.channels, bias=False)
+        self.dir_d = nn.Conv2d(self.channels, self.channels, kernel_size=3, padding=2, dilation=2, groups=self.channels, bias=False)
+        self.dir_fuse = nn.Sequential(
+            nn.Conv2d(3 * self.channels, self.channels, kernel_size=1, bias=False),
+            _make_gn(self.channels, gn_groups),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor):
+        b, c, h, w = x.shape
+        if c != self.channels:
+            raise RuntimeError(f"HaarHighFrequencyDetail 通道不匹配: 期望 {self.channels}, 实际 {c}")
+
+        # 如果 H/W 是奇数，先补到偶数再做 Haar。
+        pad_h = h % 2
+        pad_w = w % 2
+        x_pad = x
+        if pad_h or pad_w:
+            x_pad = F.pad(x_pad, (0, pad_w, 0, pad_h), mode="reflect")
+
+        hf = F.conv2d(
+            x_pad,
+            self.haar_hf_weight.to(dtype=x.dtype),
+            stride=2,
+            padding=0,
+            groups=self.channels,
+        )
+        hf = F.interpolate(hf, size=(h, w), mode="bilinear", align_corners=False)
+        hf = self.fuse(hf)
+
+        dh = self.dir_h(x)
+        dv = self.dir_v(x)
+        dd = self.dir_d(x)
+        direction = self.dir_fuse(torch.cat([dh, dv, dd], dim=1))
+
+        return hf + direction
+
+
+class DeformableBidirectionalStructureCorrection(nn.Module):
+    """
+    DBSC: Deformable Bidirectional Structure Correction.
+
+    参考 Dino U-Net 的 MSDeformAttn 思想，但不替换当前 DC_v4_3 的 DINO 多层结构选择。
+    当前模块只替换原 SimpleDinoInjector：
+
+        DINO -> CNN:
+            CNN feature 作为 query，G4/G8/G16 作为 multi-scale value，增强 CNN。
+
+        CNN -> DINO:
+            DINO guidance 作为 query，x1/x2/x3 作为 multi-scale value，校正 DINO guidance。
+
+    对 H/4 stage 可选加入 SFFNet-style Haar 高频细节分支。
+    """
+    def __init__(
+        self,
+        cnn_channels: int,
+        dino_channels: int,
+        d_model: int,
+        num_heads: int,
+        n_levels: int = 3,
+        n_points: int = 4,
+        deform_ratio: float = 1.0,
+        gamma_init: float = 0.1,
+        gn_groups: int = 8,
+        dino_repo_path: Optional[str] = None,
+        use_frequency_detail: bool = False,
+    ):
+        super().__init__()
+
+        self.cnn_channels = int(cnn_channels)
+        self.dino_channels = int(dino_channels)
+        self.d_model = int(d_model)
+        self.num_heads = int(num_heads)
+        self.n_levels = int(n_levels)
+        self.n_points = int(n_points)
+        self.use_frequency_detail = bool(use_frequency_detail)
+
+        MSDeformAttn = _import_ms_deform_attn(dino_repo_path)
+
+        self.q_cnn = ConvGNAct(
+            self.cnn_channels,
+            self.d_model,
+            kernel_size=1,
+            padding=0,
+            gn_groups=gn_groups,
+        )
+        self.q_dino = ConvGNAct(
+            self.dino_channels,
+            self.d_model,
+            kernel_size=1,
+            padding=0,
+            gn_groups=gn_groups,
+        )
+
+        # 固定使用 [x1, x2, x3] / [g4, g8, g16]
+        self.cnn_value = MultiScaleFeatureProjector(
+            in_channels_list=[64, 128, 256],
+            d_model=self.d_model,
+            gn_groups=gn_groups,
+        )
+        self.dino_value = MultiScaleFeatureProjector(
+            in_channels_list=[64, 128, 256],
+            d_model=self.d_model,
+            gn_groups=gn_groups,
+        )
+
+        self.d2c_attn = MSDeformAttn(
+            d_model=self.d_model,
+            n_levels=self.n_levels,
+            n_heads=self.num_heads,
+            n_points=self.n_points,
+            ratio=deform_ratio,
+        )
+        self.c2d_attn = MSDeformAttn(
+            d_model=self.d_model,
+            n_levels=self.n_levels,
+            n_heads=self.num_heads,
+            n_points=self.n_points,
+            ratio=deform_ratio,
+        )
+
+        self.to_cnn = nn.Sequential(
+            ConvGNAct(self.d_model, self.cnn_channels, kernel_size=1, padding=0, gn_groups=gn_groups),
+            ResidualRefineGN(self.cnn_channels, gn_groups=gn_groups),
+        )
+        self.to_dino = nn.Sequential(
+            ConvGNAct(self.d_model, self.dino_channels, kernel_size=1, padding=0, gn_groups=gn_groups),
+            ResidualRefineGN(self.dino_channels, gn_groups=gn_groups),
+        )
+
+        self.g_to_x = (
+            nn.Identity()
+            if self.dino_channels == self.cnn_channels
+            else ConvGNAct(self.dino_channels, self.cnn_channels, kernel_size=1, padding=0, gn_groups=gn_groups)
+        )
+
+        self.x_refine = ResidualRefineGN(self.cnn_channels, gn_groups=gn_groups)
+        self.g_refine = ResidualRefineGN(self.dino_channels, gn_groups=gn_groups)
+
+        if self.use_frequency_detail:
+            self.detail_branch = HaarHighFrequencyDetail(self.cnn_channels, gn_groups=gn_groups)
+            self.detail_to_g = (
+                nn.Identity()
+                if self.cnn_channels == self.dino_channels
+                else ConvGNAct(self.cnn_channels, self.dino_channels, kernel_size=1, padding=0, gn_groups=gn_groups)
+            )
+            self.detail_gate = nn.Sequential(
+                nn.Conv2d(self.dino_channels * 3, self.dino_channels, kernel_size=1, bias=True),
+                nn.Sigmoid(),
+            )
+        else:
+            self.detail_branch = None
+            self.detail_to_g = None
+            self.detail_gate = None
+
+        self.gamma_d2c = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.gamma_c2d = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.gamma_g2x = nn.Parameter(torch.tensor(float(gamma_init)))
+
+    @staticmethod
+    def _tokens_to_map(tokens: torch.Tensor, height: int, width: int):
+        b, n, c = tokens.shape
+        if n != height * width:
+            raise RuntimeError(f"token 数量和目标尺寸不匹配: N={n}, H×W={height * width}")
+        return tokens.transpose(1, 2).contiguous().view(b, c, height, width)
+
+    def _query_tokens(self, feat: torch.Tensor, proj: nn.Module):
+        q = proj(feat)
+        b, c, h, w = q.shape
+        q = q.flatten(2).transpose(1, 2).contiguous()
+        ref = _make_reference_points(
+            batch_size=b,
+            height=h,
+            width=w,
+            n_levels=self.n_levels,
+            device=q.device,
+            dtype=q.dtype,
+        )
+        return q, ref, h, w
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        g: torch.Tensor,
+        cnn_feats: List[torch.Tensor],
+        dino_feats: List[torch.Tensor],
+    ):
+        if g.shape[-2:] != x.shape[-2:]:
+            g = F.interpolate(g, size=x.shape[-2:], mode="bilinear", align_corners=False)
+
+        # ---------- DINO -> CNN: CNN query, DINO multi-scale value ----------
+        q_cnn, ref_cnn, hx, wx = self._query_tokens(x, self.q_cnn)
+        v_dino, dino_shapes, dino_start = self.dino_value(dino_feats)
+        s_d2c = self.d2c_attn(q_cnn, ref_cnn, v_dino, dino_shapes, dino_start, None)
+        s_d2c = self._tokens_to_map(s_d2c, hx, wx)
+        x_delta = self.to_cnn(s_d2c)
+
+        # ---------- CNN -> DINO: DINO query, CNN multi-scale value ----------
+        q_dino, ref_dino, hg, wg = self._query_tokens(g, self.q_dino)
+        v_cnn, cnn_shapes, cnn_start = self.cnn_value(cnn_feats)
+        s_c2d = self.c2d_attn(q_dino, ref_dino, v_cnn, cnn_shapes, cnn_start, None)
+        s_c2d = self._tokens_to_map(s_c2d, hg, wg)
+        g_delta = self.to_dino(s_c2d)
+
+        # ---------- SFFNet-style H/4 high-frequency detail correction ----------
+        if self.use_frequency_detail:
+            detail = self.detail_to_g(self.detail_branch(x))
+            if detail.shape[-2:] != g_delta.shape[-2:]:
+                detail = F.interpolate(detail, size=g_delta.shape[-2:], mode="bilinear", align_corners=False)
+            gate = self.detail_gate(torch.cat([g, g_delta, detail], dim=1))
+            g_delta = g_delta + gate * detail
+
+        # ---------- Bidirectional residual update ----------
+        g_hat = g + self.gamma_c2d * self.g_refine(g_delta)
+        x_hat = x + self.gamma_d2c * self.x_refine(x_delta) + self.gamma_g2x * self.g_to_x(g_hat)
+
+        return x_hat, g_hat
+
+
+class ConnectivityPriorHead(nn.Module):
+    """
+    SegRoadv2-style connectivity auxiliary head.
+
+    默认输出 9 个通道，可表示中心点及 8 邻域连接关系。
+    普通 train.py 不会使用该输出；若要使用，需要在 train_DC.py 中读取 connect_logits。
+    """
+    def __init__(self, in_channels: int = 64, num_neighbors: int = 9, gn_groups: int = 8):
+        super().__init__()
+        self.head = nn.Sequential(
+            ConvGNAct(in_channels, in_channels, kernel_size=3, gn_groups=gn_groups),
+            nn.Conv2d(in_channels, num_neighbors, kernel_size=3, padding=1, bias=True),
+        )
+        self.head_dilated = nn.Sequential(
+            ConvGNAct(in_channels, in_channels, kernel_size=3, gn_groups=gn_groups),
+            nn.Conv2d(in_channels, num_neighbors, kernel_size=3, padding=3, dilation=3, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor, target_size: Tuple[int, int]):
+        con = self.head(x) + self.head_dilated(x)
+        if con.shape[-2:] != target_size:
+            con = F.interpolate(con, size=target_size, mode="bilinear", align_corners=False)
+        return con
+
+
+class DC_v4_3(nn.Module):
+    """
+    DC_v4_3: DC_v4_2 + DBSC，可变形双向结构校正的 BS4 版本。
+
+    和 DC_v4_1 保持一致的部分：
+        1. Frozen DINOv3 token extractor
+        2. Token-Structure Adapter
+        3. A2/A5/A8/A11
+        4. Stage-aware Router: W16/W8/W4
+        5. Stage Projection: G16/G8/G4
+        6. DBSC 可变形双向结构校正到 x3/x2/x1
+
+    唯一结构差异：
+        1. CNN encoder 只到 layer3，即 x3: H/16, 256
+        2. 不注册 layer4，不计算 x4
+        3. 删除 dec3，decoder 从 x3_hat -> x2_hat 开始
+
+    输入尺寸支持:
+        1024 / 512 / 256 / 128
+    只要求 H/W 能被 dino_patch_size=16 整除。
+    """
+    def __init__(
+        self,
+        n_channels=3,
+        n_classes=1,
+        num_classes=None,
+        in_channels=None,
+        pretrained=True,
+        return_aux=False,
+
+        dino_model_name="dinov3_vits16",
+        dino_repo_path="/home/u2508183004/zyn/SEG/dinounet/dinov3",
+        dino_ckpt_path="/home/u2508183004/zyn/SEG/weight/dinov3/dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+        dino_layers=(2, 5, 8, 11),
+        dino_embed_dim=384,
+        dino_patch_size=16,
+        dino_normalize=False,
+        dino_intermediate_norm=False,
+
+        adapter_channels=128,
+        adapter_bottleneck=64,
+        adapter_alpha_init=0.01,
+        adapter_beta_init=0.1,
+
+        structure_queries=32,
+        structure_heads=8,
+        structure_mlp_ratio=2.0,
+        structure_dropout=0.0,
+
+        router_hidden=512,
+        router_logit_scale_init=0.1,
+
+        injector_gamma_init=0.1,
+        # DBSC: Dino U-Net-style MSDeformAttn 双向结构校正
+        dbsc_d16=256,
+        dbsc_d8=192,
+        dbsc_d4=128,
+        dbsc_heads16=8,
+        dbsc_heads8=6,
+        dbsc_heads4=4,
+        dbsc_points=4,
+        dbsc_deform_ratio=1.0,
+        enable_g4_frequency_detail=True,
+        gn_groups=8,
+
+        enable_dino_prior_head=True,
+        enable_connect_head=True,
+
+        **kwargs,
+    ):
+        super().__init__()
+
+        if in_channels is not None:
+            n_channels = in_channels
+
+        if num_classes is not None:
+            n_classes = num_classes
+
+        self.n_channels = int(n_channels)
+        self.n_classes = int(n_classes)
+        self.return_aux = bool(return_aux)
+        self.dino_layers = [int(x) for x in dino_layers]
+        self.dino_patch_size = int(dino_patch_size)
+        self.enable_dino_prior_head = bool(enable_dino_prior_head)
+
+        encoder = self._get_resnet34(pretrained=pretrained)
+
+        if self.n_channels != 3:
+            self.input_adapter = nn.Conv2d(
+                self.n_channels,
+                3,
+                kernel_size=1,
+                bias=False,
+            )
+        else:
+            self.input_adapter = nn.Identity()
+
+        # CNN BS4 encoder: 和 DC_v4_1 前几层一致，只是不注册 layer4。
+        self.stem = nn.Sequential(
+            encoder.conv1,
+            encoder.bn1,
+            encoder.relu,
+        )
+        self.maxpool = encoder.maxpool
+        self.layer1 = encoder.layer1
+        self.layer2 = encoder.layer2
+        self.layer3 = encoder.layer3
+        # 注意：DC_v4_3 不注册 self.layer4，确保真正砍掉 x4 参数。
+
+        # Frozen DINO token branch. 完全保持 DC_v4_1 方案。
+        self.dino = FrozenDINOv3TokenExtractor(
+            dino_model_name=dino_model_name,
+            dino_repo_path=dino_repo_path,
+            dino_ckpt_path=dino_ckpt_path,
+            out_layers=dino_layers,
+            embed_dim=dino_embed_dim,
+            patch_size=dino_patch_size,
+            dino_normalize=dino_normalize,
+            dino_intermediate_norm=dino_intermediate_norm,
+        )
+
+        self.dino_pyramid = DinoStructurePyramid(
+            dino_layers=dino_layers,
+            embed_dim=dino_embed_dim,
+            token_bottleneck=adapter_bottleneck,
+            adapter_channels=adapter_channels,
+            structure_queries=structure_queries,
+            structure_heads=structure_heads,
+            structure_mlp_ratio=structure_mlp_ratio,
+            adapter_alpha_init=adapter_alpha_init,
+            adapter_beta_init=adapter_beta_init,
+            dropout=structure_dropout,
+            gn_groups=gn_groups,
+        )
+
+        self.router16 = StageAwareRouter(
+            stage="16",
+            dino_layers=dino_layers,
+            adapter_channels=adapter_channels,
+            embed_dim=dino_embed_dim,
+            structure_queries=structure_queries,
+            router_hidden=router_hidden,
+            logit_scale_init=router_logit_scale_init,
+        )
+
+        self.router8 = StageAwareRouter(
+            stage="8",
+            dino_layers=dino_layers,
+            adapter_channels=adapter_channels,
+            embed_dim=dino_embed_dim,
+            structure_queries=structure_queries,
+            router_hidden=router_hidden,
+            logit_scale_init=router_logit_scale_init,
+        )
+
+        self.router4 = StageAwareRouter(
+            stage="4",
+            dino_layers=dino_layers,
+            adapter_channels=adapter_channels,
+            embed_dim=dino_embed_dim,
+            structure_queries=structure_queries,
+            router_hidden=router_hidden,
+            logit_scale_init=router_logit_scale_init,
+        )
+
+        self.stage_projection = StageProjectionHead(
+            in_channels=adapter_channels,
+            g16_channels=256,
+            g8_channels=128,
+            g4_channels=64,
+            gn_groups=gn_groups,
+        )
+
+        # DBSC replaces the old SimpleDinoInjector.
+        # DINO -> CNN: CNN query, DINO multi-scale value.
+        # CNN  -> DINO: DINO query, CNN multi-scale value.
+        self.dbsc16 = DeformableBidirectionalStructureCorrection(
+            cnn_channels=256,
+            dino_channels=256,
+            d_model=dbsc_d16,
+            num_heads=dbsc_heads16,
+            n_levels=3,
+            n_points=dbsc_points,
+            deform_ratio=dbsc_deform_ratio,
+            gamma_init=injector_gamma_init,
+            gn_groups=gn_groups,
+            dino_repo_path=dino_repo_path,
+            use_frequency_detail=False,
+        )
+
+        self.dbsc8 = DeformableBidirectionalStructureCorrection(
+            cnn_channels=128,
+            dino_channels=128,
+            d_model=dbsc_d8,
+            num_heads=dbsc_heads8,
+            n_levels=3,
+            n_points=dbsc_points,
+            deform_ratio=dbsc_deform_ratio,
+            gamma_init=injector_gamma_init,
+            gn_groups=gn_groups,
+            dino_repo_path=dino_repo_path,
+            use_frequency_detail=False,
+        )
+
+        self.dbsc4 = DeformableBidirectionalStructureCorrection(
+            cnn_channels=64,
+            dino_channels=64,
+            d_model=dbsc_d4,
+            num_heads=dbsc_heads4,
+            n_levels=3,
+            n_points=dbsc_points,
+            deform_ratio=dbsc_deform_ratio,
+            gamma_init=injector_gamma_init,
+            gn_groups=gn_groups,
+            dino_repo_path=dino_repo_path,
+            use_frequency_detail=enable_g4_frequency_detail,
+        )
+
+        # BS4 decoder：删除 dec3，从 x3_hat -> x2_hat 开始。
+        self.dec2_start = ResidualDecoderBlock(
+            in_channels=256,
+            skip_channels=128,
+            out_channels=128,
+        )
+
+        self.dec1 = ResidualDecoderBlock(
+            in_channels=128,
+            skip_channels=64,
+            out_channels=96,
+        )
+
+        self.dec0 = ResidualDecoderBlock(
+            in_channels=96,
+            skip_channels=64,
+            out_channels=64,
+        )
+
+        self.out_head = nn.Sequential(
+            ConvBNAct(64, 64, kernel_size=3),
+            ConvBNAct(64, 64, kernel_size=3),
+            nn.Conv2d(64, self.n_classes, kernel_size=1),
+        )
+
+        if self.enable_dino_prior_head:
+            # 可选 DINO-side direct supervision。
+            # 普通 train.py 不会用；train_DC.py / forward_train 可用它进一步约束 DINO guidance。
+            self.dino_prior_head = nn.Sequential(
+                ConvGNAct(64, 64, kernel_size=3, gn_groups=gn_groups),
+                nn.Conv2d(64, self.n_classes, kernel_size=1),
+            )
+        else:
+            self.dino_prior_head = None
+
+        if bool(enable_connect_head):
+            self.connect_head = ConnectivityPriorHead(
+                in_channels=64,
+                num_neighbors=9,
+                gn_groups=gn_groups,
+            )
+        else:
+            self.connect_head = None
+
+        self._print_trainable_summary()
+
+    @staticmethod
+    def _get_resnet34(pretrained=True):
+        try:
+            from torchvision.models import resnet34, ResNet34_Weights
+
+            weights = ResNet34_Weights.IMAGENET1K_V1 if pretrained else None
+            model = resnet34(weights=weights)
+            return model
+
+        except Exception:
+            from torchvision import models
+
+            try:
+                model = models.resnet34(pretrained=pretrained)
+            except TypeError:
+                model = models.resnet34(
+                    weights="IMAGENET1K_V1" if pretrained else None
+                )
+
+            return model
+
+    def _print_trainable_summary(self):
+        total = 0
+        trainable = 0
+        dino_trainable = 0
+
+        for p in self.parameters():
+            total += p.numel()
+            if p.requires_grad:
+                trainable += p.numel()
+
+        for p in self.dino.parameters():
+            if p.requires_grad:
+                dino_trainable += p.numel()
+
+        print("--------------------------------------------------")
+        print("🔧 DC_v4_3 DINO-centric Structure Pyramid + BS4 Encoder")
+        print(f"    - 总参数量:       {total / 1e6:.2f} M")
+        print(f"    - 可训练参数量:   {trainable / 1e6:.2f} M")
+        print(f"    - DINO原始主干可训练: {dino_trainable / 1e6:.2f} M")
+        print("    - 说明: DINOv3 原始主干冻结；DINO侧 Token/A/W/G 完全保留；CNN侧砍掉 x4/layer4/dec3；交互替换为 DBSC")
+        print("--------------------------------------------------")
+
+    def train(self, mode=True):
+        super().train(mode)
+        # 无论外部怎么切 train/eval，DINO 原始主干始终 eval。
+        self.dino.train(False)
+        return self
+
+    def _build_a_stack(self, a_dict: Dict[int, torch.Tensor]):
+        feats = []
+
+        for layer in self.dino_layers:
+            if layer not in a_dict:
+                raise KeyError(
+                    f"a_dict 缺少 layer={layer}。当前 keys={list(a_dict.keys())}"
+                )
+            feats.append(a_dict[layer])
+
+        return torch.stack(feats, dim=1)
+
+    def forward_features(self, x, need_aux=False):
+        input_size = x.shape[-2:]
+
+        if input_size[0] % self.dino_patch_size != 0 or input_size[1] % self.dino_patch_size != 0:
+            raise RuntimeError(
+                f"DC_v4_3 要求输入 H/W 能被 dino_patch_size 整除。"
+                f"当前输入={input_size}, patch_size={self.dino_patch_size}"
+            )
+
+        x_in = self.input_adapter(x)
+
+        # CNN BS4 encoder.
+        x0 = self.stem(x_in)                    # B, 64,  H/2
+        x1 = self.layer1(self.maxpool(x0))      # B, 64,  H/4
+        x2 = self.layer2(x1)                    # B, 128, H/8
+        x3 = self.layer3(x2)                    # B, 256, H/16
+
+        patch_hw = x3.shape[-2:]
+
+        # Frozen DINO tokens.
+        token_dict = self.dino(x_in)
+
+        # Token-Structure Adapter.
+        a_dict, z_dict = self.dino_pyramid(
+            token_dict=token_dict,
+            patch_hw=patch_hw,
+        )
+
+        a_stack = self._build_a_stack(a_dict)
+
+        # Stage-aware routing. 完全保持 DC_v4_1 的 DINO 多层结构特征选择。
+        r16, w16 = self.router16(a_stack, z_dict)
+        r8, w8 = self.router8(a_stack, z_dict)
+        r4, w4 = self.router4(a_stack, z_dict)
+
+        # R -> G, dynamic target size.
+        g16, g8, g4 = self.stage_projection(
+            r16=r16,
+            r8=r8,
+            r4=r4,
+            target16=x3.shape[-2:],
+            target8=x2.shape[-2:],
+            target4=x1.shape[-2:],
+        )
+
+        # DBSC: Deformable Bidirectional Structure Correction.
+        # 使用 [x1, x2, x3] 与 [g4, g8, g16] 做三尺度双向可变形注意力校正。
+        cnn_feats = [x1, x2, x3]
+        dino_feats = [g4, g8, g16]
+
+        x3_hat, g16_hat = self.dbsc16(
+            x=x3,
+            g=g16,
+            cnn_feats=cnn_feats,
+            dino_feats=dino_feats,
+        )
+        x2_hat, g8_hat = self.dbsc8(
+            x=x2,
+            g=g8,
+            cnn_feats=cnn_feats,
+            dino_feats=dino_feats,
+        )
+        x1_hat, g4_hat = self.dbsc4(
+            x=x1,
+            g=g4,
+            cnn_feats=cnn_feats,
+            dino_feats=dino_feats,
+        )
+
+        # BS4 decoder：从 x3_hat 直接解码到 x2_hat。
+        d2 = self.dec2_start(x3_hat, x2_hat)
+        d1 = self.dec1(d2, x1_hat)
+        d0 = self.dec0(d1, x0)
+
+        logits_half = self.out_head(d0)
+
+        logits = F.interpolate(
+            logits_half,
+            size=input_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        dino_prior_logits = None
+        connect_logits = None
+
+        if self.dino_prior_head is not None:
+            dino_prior_logits = self.dino_prior_head(g4_hat)
+
+        if self.connect_head is not None and need_aux:
+            connect_logits = self.connect_head(g4_hat, target_size=input_size)
+
+        aux = None
+
+        if need_aux:
+            aux = {
+                "final_logits": logits,
+                "logits_half": logits_half,
+                "dino_prior_logits": dino_prior_logits,
+                "connect_logits": connect_logits,
+
+                "x0": x0,
+                "x1": x1,
+                "x2": x2,
+                "x3": x3,
+
+                "x1_hat": x1_hat,
+                "x2_hat": x2_hat,
+                "x3_hat": x3_hat,
+
+                "r16": r16,
+                "r8": r8,
+                "r4": r4,
+
+                "g16": g16,
+                "g8": g8,
+                "g4": g4,
+
+                "g16_hat": g16_hat,
+                "g8_hat": g8_hat,
+                "g4_hat": g4_hat,
+
+                "w16": w16,
+                "w8": w8,
+                "w4": w4,
+
+                "d2": d2,
+                "d1": d1,
+                "d0": d0,
+
+                "gamma16_d2c": self.dbsc16.gamma_d2c.detach(),
+                "gamma16_c2d": self.dbsc16.gamma_c2d.detach(),
+                "gamma8_d2c": self.dbsc8.gamma_d2c.detach(),
+                "gamma8_c2d": self.dbsc8.gamma_c2d.detach(),
+                "gamma4_d2c": self.dbsc4.gamma_d2c.detach(),
+                "gamma4_c2d": self.dbsc4.gamma_c2d.detach(),
+            }
+
+            for k, v in a_dict.items():
+                aux[f"A{k}"] = v
+
+            for k, v in z_dict.items():
+                aux[f"Z{k}"] = v
+
+        return logits, dino_prior_logits, aux
+
+    def forward(self, x):
+        logits, dino_prior_logits, aux = self.forward_features(
+            x,
+            need_aux=self.return_aux,
+        )
+
+        if self.return_aux:
+            return aux
+
+        return logits
+
+    def forward_train(self, x):
+        _, _, aux = self.forward_features(
+            x,
+            need_aux=True,
+        )
+
+        return {
+            "final_logits": aux["final_logits"],
+            "base_logits": None,
+            "dino_prior_logits": aux["dino_prior_logits"],
+            "connect_logits": aux["connect_logits"],
+            "logits_half": aux["logits_half"],
+        }
+
+
+if __name__ == "__main__":
+    # 只做结构检查用。
+    # 实际使用时需要提供真实 dino_repo_path / dino_ckpt_path。
+    model = DC_v4_3(
+        n_channels=3,
+        n_classes=1,
+        pretrained=False,
+        return_aux=False,
+        dino_ckpt_path="",
+    )
+
+    x = torch.randn(1, 3, 256, 256)
+    y = model(x)
+
+    print("Input :", x.shape)
+    if isinstance(y, dict):
+        print("Output keys:", y.keys())
+    else:
+        print("Output:", y.shape)
